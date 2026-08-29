@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sahara-mcp"
+version = "0.1.0"
+description = "MCP server for the Qualcomm Sahara (EDL) boot protocol over USB"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = [
+    "mcp",
+    "pyusb>=1.2",
+]
+
+[project.optional-dependencies]
+windows = ["libusb"]
+
+[tool.setuptools]
+py-modules = ["sahara_mcp_server"]
