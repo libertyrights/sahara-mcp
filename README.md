@@ -85,6 +85,6 @@ first `HELLO`).
 
 ## License
 
-[MIT](LICENSE). Protocol facts derived from `linux-msm/qdl`
+[GPL-3.0](LICENSE). Protocol facts derived from `linux-msm/qdl`
 (BSD-3-Clause, Linaro Ltd / Qualcomm referents in that project's headers);
-all code here is original.
+all code here is original. Copyright (c) 2026 libertyrights.
