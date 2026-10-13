@@ -562,6 +562,144 @@ def _with_sahara(index: int, fn):
         s.t.close()
 
 
+# ---- safety guardrails ----------------------------------------------------
+
+
+def _guard_payload(action: str, would_do: Dict[str, object]) -> Dict[str, object]:
+    """Standard dry-run payload for a guarded (device-acting) tool.
+
+    Mirrors the ``dry_run``/``confirm`` convention used by our sibling
+    ``edl-mcp`` server: nothing is touched until ``dry_run=False`` AND
+    ``confirm=True`` are both passed.
+    """
+    return {
+        "dry_run": True,
+        "executed": False,
+        "would_do": would_do,
+        "message": ("DRY RUN — nothing done; set dry_run=False and "
+                    "confirm=True to proceed."),
+    }
+
+
+# ---- tools ----------------------------------------------------------------
+
+
+def sahara_list_devices() -> list:
+    """List Qualcomm EDL devices currently visible over USB. Read-only."""
+    try:
+        _require()
+        return _list_devices()
+    except SaharaError as exc:
+        return [{"error": str(exc)}]
+
+
+def sahara_handshake(index: int = 0) -> dict:
+    """Perform the Sahara HELLO exchange and report the device mode. Read-only."""
+    try:
+        def do(s: Sahara):
+            h = s.recv_hello()
+            s.send_hello_resp(h["version"], h["mode"])
+            return {
+                "version": h["version"],
+                "compatible": h["compatible"],
+                "max_length": h["max_length"],
+                "mode": MODE_NAMES.get(h["mode"], h["mode"]),
+            }
+        return _with_sahara(index, do)
+    except SaharaError as exc:
+        return {"error": str(exc)}
+
+
+def sahara_chipinfo(index: int = 0) -> dict:
+    """Identify the EDL device's SoC (serial, HW/chip id, PK hash). Read-only."""
+    try:
+        return _with_sahara(index, lambda s: s.chip_info())
+    except SaharaError as exc:
+        return {"error": str(exc)}
+
+
+def sahara_upload(index: int = 0, images: str = "0:prog_firehose.elf",
+                  dry_run: bool = True, confirm: bool = False) -> dict:
+    """Enter Sahara image-transfer mode and serve one or more images.
+
+    `images` is a comma-separated list of `id:path` pairs. Most commonly
+    a single Firehose programmer as image id 0:
+    `0:C:\\path\\prog_firehose_ddr.elf`
+
+    SAFETY: DESTRUCTIVE — this writes an image to the device. Unless BOTH
+    ``dry_run=False`` AND ``confirm=True`` are passed, nothing is written: no
+    USB transport is opened and a dry-run payload is returned instead.
+    """
+    if dry_run or not confirm:
+        return _guard_payload("upload", {"action": "upload", "images": images})
+    try:
+        image_map: Dict[int, bytes] = {}
+        report: Dict[str, object] = {}
+        for item in (p.strip() for p in images.split(",") if p.strip()):
+            if ":" not in item:
+                raise SaharaError(f"image spec {item!r} must be id:path")
+            image_id_s, path = item.split(":", 1)
+            image_id = int(image_id_s, 0)
+            if not os.path.isfile(path):
+                raise SaharaError(f"image file not found: {path}")
+            with open(path, "rb") as fh:
+                blob = fh.read()
+            image_map[image_id] = blob
+            report[str(image_id)] = {"path": path, "size": len(blob)}
+
+        def do(s: Sahara):
+            res = s.upload(image_map)
+            report.update(res)
+            return report
+
+        return _with_sahara(index, do)
+    except SaharaError as exc:
+        return {"error": str(exc)}
+
+
+def sahara_execute(index: int = 0, command: str = "msm_hw_id") -> dict:
+    """Run a single Sahara command-mode client command. Read-only.
+
+    `command` may be: serial, msm_hw_id, oem_pk_hash, chip_id_v3, or a
+    raw number (e.g. 0x0A).
+    """
+    try:
+        if command.lower() in EXEC_CMD_NAMES:
+            client_cmd = EXEC_CMD_NAMES[command.lower()]
+        else:
+            client_cmd = int(command, 0)
+
+        def do(s: Sahara):
+            hello = s.recv_hello()
+            s.enter_command_mode(hello["version"])
+            raw = s.exec_command(client_cmd)
+            return {
+                "result": raw.hex(),
+                "length": len(raw),
+            }
+
+        return _with_sahara(index, do)
+    except SaharaError as exc:
+        return {"error": str(exc)}
+
+
+def sahara_reset(index: int = 0, dry_run: bool = True,
+                 confirm: bool = False) -> dict:
+    """Reset (reboot) an EDL device over the Sahara protocol.
+
+    SAFETY: DESTRUCTIVE — this reboots/resets the device. Unless BOTH
+    ``dry_run=False`` AND ``confirm=True`` are passed, nothing happens: no USB
+    transport is opened and a dry-run payload is returned instead.
+    """
+    if dry_run or not confirm:
+        return _guard_payload("reset", {"action": "reset"})
+    try:
+        _with_sahara(index, lambda s: s.reset())
+        return {"status": "reset issued"}
+    except SaharaError as exc:
+        return {"error": str(exc)}
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     if FastMCP is None:
@@ -572,106 +710,17 @@ def main() -> None:
 
     mcp = FastMCP("sahara-mcp")
 
-    @mcp.tool()
-    def sahara_list_devices() -> list:
-        """List Qualcomm EDL devices currently visible over USB."""
-        try:
-            _require()
-            return _list_devices()
-        except SaharaError as exc:
-            return [{"error": str(exc)}]
-
-    @mcp.tool()
-    def sahara_handshake(index: int = 0) -> dict:
-        """Perform the Sahara HELLO exchange and report the device mode."""
-        try:
-            def do(s: Sahara):
-                h = s.recv_hello()
-                s.send_hello_resp(h["version"], h["mode"])
-                return {
-                    "version": h["version"],
-                    "compatible": h["compatible"],
-                    "max_length": h["max_length"],
-                    "mode": MODE_NAMES.get(h["mode"], h["mode"]),
-                }
-            return _with_sahara(index, do)
-        except SaharaError as exc:
-            return {"error": str(exc)}
-
-    @mcp.tool()
-    def sahara_chipinfo(index: int = 0) -> dict:
-        """Identify the EDL device's SoC (serial, HW/chip id, PK hash)."""
-        try:
-            return _with_sahara(index, lambda s: s.chip_info())
-        except SaharaError as exc:
-            return {"error": str(exc)}
-
-    @mcp.tool()
-    def sahara_upload(index: int = 0, images: str = "0:prog_firehose.elf") -> dict:
-        """Enter Sahara image-transfer mode and serve one or more images.
-
-        `images` is a comma-separated list of `id:path` pairs. Most commonly
-        a single Firehose programmer as image id 0:
-        `0:C:\\path\\prog_firehose_ddr.elf`
-        """
-        try:
-            image_map: Dict[int, bytes] = {}
-            report: Dict[str, object] = {}
-            for item in (p.strip() for p in images.split(",") if p.strip()):
-                if ":" not in item:
-                    raise SaharaError(f"image spec {item!r} must be id:path")
-                image_id_s, path = item.split(":", 1)
-                image_id = int(image_id_s, 0)
-                if not os.path.isfile(path):
-                    raise SaharaError(f"image file not found: {path}")
-                with open(path, "rb") as fh:
-                    blob = fh.read()
-                image_map[image_id] = blob
-                report[str(image_id)] = {"path": path, "size": len(blob)}
-
-            def do(s: Sahara):
-                res = s.upload(image_map)
-                report.update(res)
-                return report
-
-            return _with_sahara(index, do)
-        except SaharaError as exc:
-            return {"error": str(exc)}
-
-    @mcp.tool()
-    def sahara_execute(index: int = 0, command: str = "msm_hw_id") -> dict:
-        """Run a single Sahara command-mode client command.
-
-        `command` may be: serial, msm_hw_id, oem_pk_hash, chip_id_v3, or a
-        raw number (e.g. 0x0A).
-        """
-        try:
-            if command.lower() in EXEC_CMD_NAMES:
-                client_cmd = EXEC_CMD_NAMES[command.lower()]
-            else:
-                client_cmd = int(command, 0)
-
-            def do(s: Sahara):
-                hello = s.recv_hello()
-                s.enter_command_mode(hello["version"])
-                raw = s.exec_command(client_cmd)
-                return {
-                    "result": raw.hex(),
-                    "length": len(raw),
-                }
-
-            return _with_sahara(index, do)
-        except SaharaError as exc:
-            return {"error": str(exc)}
-
-    @mcp.tool()
-    def sahara_reset(index: int = 0) -> dict:
-        """Reset an EDL device over the Sahara protocol."""
-        try:
-            _with_sahara(index, lambda s: s.reset())
-            return {"status": "reset issued"}
-        except SaharaError as exc:
-            return {"error": str(exc)}
+    # Tools are defined at module level (so they are unit-testable without a
+    # device) and registered here with the FastMCP decorator factory.
+    for tool in (
+        sahara_list_devices,
+        sahara_handshake,
+        sahara_chipinfo,
+        sahara_upload,
+        sahara_execute,
+        sahara_reset,
+    ):
+        mcp.tool()(tool)
 
     mcp.run()
 
